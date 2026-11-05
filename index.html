@@ -407,7 +407,7 @@ const S = {
   levels:[], mode:null, position:null, trades:[], markers:[],
   startBalance:10000, riskPct:1, feePct:0.05, nBars:3000, iv:'1h',
   playing:false, timer:null, hideTime:false, inds:[], vis:[],
-  lines:[]
+  lines:[], htfSrc:{}, htfAgg:{}
 };
 
 /* ---------- Lưu trữ ---------- */
@@ -423,12 +423,12 @@ function load(){
       if([3000,5000,10000,20000,50000].includes(d.nBars)) S.nBars = d.nBars;
       if(Array.isArray(d.inds)) S._indCfg = d.inds;
       if(IV[d.iv]) S.iv = d.iv;
-      S._v2 = !!d.v2;
+      S._v2 = !!d.v2; S._v3 = !!d.v3;
     }
   }catch(e){}
 }
 function save(){
-  try{ localStorage.setItem(LS_KEY, JSON.stringify({trades:S.trades,startBalance:S.startBalance,riskPct:S.riskPct,feePct:S.feePct,nBars:S.nBars,iv:S.iv,v2:true,inds:(S.inds||[]).map(i=>({type:i.type,p:i.p,color:i.color}))})); }catch(e){}
+  try{ localStorage.setItem(LS_KEY, JSON.stringify({trades:S.trades,startBalance:S.startBalance,riskPct:S.riskPct,feePct:S.feePct,nBars:S.nBars,iv:S.iv,v2:true,v3:true,inds:(S.inds||[]).map(i=>({type:i.type,p:i.p,color:i.color}))})); }catch(e){}
 }
 function balance(){ return S.startBalance + S.trades.reduce((a,t)=>a+t.pnl,0); }
 
@@ -503,8 +503,18 @@ async function loadBinance(){
       if(d.length<lim) break;
     }
     if(all.length<200) throw new Error('Dữ liệu quá ít để luyện tập (cần ít nhất 200 nến).');
-    const bars = all.map(k=>({time:Math.floor(k[0]/1000), open:+k[1], high:+k[2], low:+k[3], close:+k[4], volume:+k[5]}));
-    setBars(dedupe(bars), sym, IV[iv]);
+    const toBar = k=>({time:Math.floor(k[0]/1000), open:+k[1], high:+k[2], low:+k[3], close:+k[4], volume:+k[5]});
+    const bars = all.map(toBar);
+    // Nến Ngày / Tuần thật từ Binance cho chỉ báo vùng HT/KC khung lớn (lịch sử dài hơn dữ liệu backtest)
+    btn.textContent = 'Đang tải nến Ngày/Tuần…';
+    const htfEnd = (all[all.length-1][0] + IV[iv]*1000) - 1, htf = {};
+    await Promise.all([['1d',86400],['1w',604800]].map(async ([code,sec])=>{
+      try{
+        const r = await fetch(`https://api.binance.com/api/v3/klines?symbol=${sym}&interval=${code}&limit=1000&endTime=${htfEnd}`);
+        if(r.ok){ const d = await r.json(); if(Array.isArray(d) && d.length) htf[sec] = dedupe(d.map(toBar)); }
+      }catch(e){}
+    }));
+    setBars(dedupe(bars), sym, IV[iv], htf);
     toast(bars.length < want
       ? `Binance chỉ có ${bars.length.toLocaleString('vi-VN')} nến ${sym} ${tfLabel(IV[iv])} trong khoảng này.`
       : `Đã tải ${bars.length.toLocaleString('vi-VN')} nến ${sym} ${tfLabel(IV[iv])}.`);
@@ -584,7 +594,9 @@ function applyTheme(){
 }
 try{ window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', applyTheme); }catch(e){}
 
-function bucketOf(t){ const w=S.intervalSec*S.tfMult; return Math.floor(t/w)*w; }
+const WEEK_OFF = 345600; // 05/01/1970 là thứ Hai: tuần bắt đầu 00:00 UTC thứ Hai, giống Binance
+function bucketTF(t,w){ return w%604800===0 ? Math.floor((t-WEEK_OFF)/w)*w+WEEK_OFF : Math.floor(t/w)*w; }
+function bucketOf(t){ return bucketTF(t, S.intervalSec*S.tfMult); }
 function plain(b){ return {time:b.time, open:b.open, high:b.high, low:b.low, close:b.close, volume:b.volume}; }
 function visible(){
   const arr = S.bars.slice(0, S.cursor+1);
@@ -753,6 +765,75 @@ function volZones(v,p){
   return {zones, prof, lo, bs, B, poc, startTime:t0, noVol};
 }
 
+/* ---------- Vùng hỗ trợ / kháng cự khung Ngày & Tuần ----------
+   Tính trên nến Ngày/Tuần (tải riêng từ Binance, hoặc gộp từ dữ liệu đang có),
+   độc lập với khung đang xem nên vùng giữ nguyên khi chuyển sang khung nhỏ.
+   Không nhìn trước tương lai: chỉ dùng nến khung lớn đã đóng tại nến hiện tại,
+   đỉnh/đáy chỉ được xác nhận khi đã có đủ nến bên phải. */
+function aggTF(bars, tf){
+  const out=[]; let cur=null;
+  for(const b of bars){
+    const k=bucketTF(b.time, tf);
+    if(!cur || cur.time!==k){ cur={time:k, open:b.open, high:b.high, low:b.low, close:b.close, partialStart: !out.length && b.time!==k}; out.push(cur); }
+    else { cur.high=Math.max(cur.high,b.high); cur.low=Math.min(cur.low,b.low); cur.close=b.close; }
+  }
+  return out.filter(c=>!c.partialStart);
+}
+function htfAll(tf){
+  if(S.htfSrc[tf] && S.htfSrc[tf].length) return {c:S.htfSrc[tf], src:'binance'};
+  if(!S.htfAgg[tf]) S.htfAgg[tf]=aggTF(S.bars, tf);
+  return {c:S.htfAgg[tf], src:'agg'};
+}
+function closedCount(c, tf, nowEnd){ let lo=0, hi=c.length; while(lo<hi){ const m=(lo+hi)>>1; if(c[m].time+tf<=nowEnd) lo=m+1; else hi=m; } return lo; }
+function buildHtfZones(c, n, sw){
+  const tr=[]; for(let i=0;i<n;i++) tr.push(i===0 ? c[i].high-c[i].low : Math.max(c[i].high-c[i].low, Math.abs(c[i].high-c[i-1].close), Math.abs(c[i].low-c[i-1].close)));
+  const atr=rma(tr, Math.min(14, Math.max(2, n>>1)));
+  const zones=[];
+  const add=(lo,hi,i,a,kind)=>{
+    const ex=zones.find(z=>lo<=z.hi && hi>=z.lo);
+    if(ex){ ex.touch++; ex.last=i; const nl=Math.min(ex.lo,lo), nh=Math.max(ex.hi,hi); if(nh-nl<=0.8*a){ ex.lo=nl; ex.hi=nh; } return; }
+    zones.push({lo, hi, t:c[i].time, born:i+sw, last:i, touch:1, origin:kind});
+  };
+  for(let i=sw;i<n-sw;i++){
+    const b=c[i]; let isH=true, isL=true;
+    for(let j=1;j<=sw;j++){
+      if(!(b.high>c[i-j].high && b.high>=c[i+j].high)) isH=false;
+      if(!(b.low<c[i-j].low && b.low<=c[i+j].low)) isL=false;
+    }
+    if(!isH && !isL) continue;
+    const a=isFinite(atr[i]) ? atr[i] : tr[i];
+    if(isH){ const h=Math.min(0.5*a, Math.max(0.2*a, b.high-Math.max(b.open,b.close))); add(b.high-h, b.high, i, a, 'H'); }
+    if(isL){ const h=Math.min(0.5*a, Math.max(0.2*a, Math.min(b.open,b.close)-b.low)); add(b.low, b.low+h, i, a, 'L'); }
+  }
+  // đếm số lần nến đóng cửa xuyên qua vùng (đảo vai trò); bị phá từ 2 lần trở lên thì bỏ
+  zones.forEach(z=>{ let side=0; z.breaks=0;
+    for(let i=z.born;i<n;i++){ const cl=c[i].close, sd= cl>z.hi?1 : cl<z.lo?-1 : 0;
+      if(sd!==0){ if(side!==0 && sd!==side) z.breaks++; side=sd; } } });
+  return zones.filter(z=>z.breaks<2);
+}
+function htfSR(p, ind){
+  if(!S.bars.length) return {zones:[], info:[]};
+  const nowEnd=S.bars[S.cursor].time+S.intervalSec, price=S.bars[S.cursor].close;
+  const res={zones:[], info:[]};
+  ind._cache = ind._cache || {};
+  [[86400,'Ngày','D',p.d],[604800,'Tuần','W',p.w]].forEach(([tf,name,code,on])=>{
+    if(!on) return;
+    if(tf<S.intervalSec){ res.info.push({code, name, na:true}); return; }
+    const {c, src}=htfAll(tf), n=closedCount(c, tf, nowEnd);
+    const key=[n, p.sw, src, c.length].join('|');
+    let all=ind._cache[tf];
+    if(!all || all.key!==key){ all={key, zones: n>=2*p.sw+5 ? buildHtfZones(c, n, p.sw) : []}; ind._cache[tf]=all; }
+    const above=all.zones.filter(z=>z.lo>price).sort((a,b)=>a.lo-b.lo).slice(0,p.n).map(z=>Object.assign({},z,{kind:'res'}));
+    const below=all.zones.filter(z=>z.hi<price).sort((a,b)=>b.hi-a.hi).slice(0,p.n).map(z=>Object.assign({},z,{kind:'sup'}));
+    const inside=all.zones.filter(z=>z.lo<=price && z.hi>=price).slice(0,2).map(z=>Object.assign({},z,{kind:'in'}));
+    const zs=above.concat(below, inside).map(z=>Object.assign(z,{tf, name, code}));
+    res.zones.push(...zs);
+    res.info.push({code, name, n, src, sup:below.length, res:above.length, inside:inside.length, short:n<2*p.sw+5});
+  });
+  res.zones.sort((a,b)=>b.tf-a.tf); // vẽ Tuần trước, Ngày đè lên
+  return res;
+}
+
 const IND = {
   sma:{name:'MA', full:'Đường trung bình động đơn giản', group:'overlay',
     params:[{k:'period',l:'Chu kỳ',v:20,min:1,max:500}], lines:[{k:'v'}],
@@ -784,6 +865,19 @@ const IND = {
     legend:ind=>{ const o=ind.out; if(!o||!o.zones) return '<span>—</span>';
       const h=o.zones.filter(z=>z.kind==='sup').length, k=o.zones.filter(z=>z.kind==='res').length, n=o.zones.filter(z=>z.kind==='in').length;
       return `<span class="up">${h} HT</span><span class="down">${k} KC</span>${n?`<span style="color:var(--accent)">giá trong vùng</span>`:''}${o.noVol?'<span>không có volume, tính theo thời gian</span>':''}`; },
+    after:()=>{ srDirty++; }, destroy:()=>{ srDirty++; }},
+  htfsr:{name:'Vùng HT/KC khung Ngày · Tuần', full:'Vùng hỗ trợ/kháng cự từ đỉnh, đáy của nến Ngày và Tuần; giữ nguyên khi xem khung nhỏ', group:'overlay',
+    params:[{k:'d',l:'Vùng khung Ngày',v:1,opts:[[1,'Hiện'],[0,'Ẩn']]},{k:'w',l:'Vùng khung Tuần',v:1,opts:[[1,'Hiện'],[0,'Ẩn']]},
+      {k:'sw',l:'Độ mạnh đỉnh/đáy (số nến mỗi bên)',v:3,min:1,max:10},{k:'n',l:'Số vùng mỗi phía, mỗi khung',v:3,min:1,max:8}],
+    lines:[], noColor:true, needsInd:true,
+    label:p=>'Vùng HT/KC ' + [p.d?'Ngày':'', p.w?'Tuần':''].filter(Boolean).join(' · '),
+    calc:(v,p,ind)=>htfSR(p, ind),
+    legend:ind=>{ const o=ind.out; if(!o || !o.info || !o.info.length) return '<span>—</span>';
+      return o.info.map(x=>{
+        if(x.na) return `<span>${x.name}: dữ liệu lớn hơn khung này</span>`;
+        if(x.short) return `<span>${x.name}: chưa đủ lịch sử (${x.n} nến)${x.src==='agg'?', tải Binance để có thêm':''}</span>`;
+        return `<span><b>${x.code}</b> <span class="up">${x.sup} HT</span> <span class="down">${x.res} KC</span>${x.inside?' <span style="color:var(--accent)">giá trong vùng</span>':''}</span>`;
+      }).join(''); },
     after:()=>{ srDirty++; }, destroy:()=>{ srDirty++; }},
   rsi:{name:'RSI', full:'Chỉ số sức mạnh tương đối (khung riêng)', group:'pane',
     params:[{k:'period',l:'Chu kỳ',v:14,min:2,max:200}], lines:[{k:'v',fmt:'2'}], levels:[70,30], range:[0,100],
@@ -873,7 +967,7 @@ function histColor(ind,i,arr,v){
 }
 function computeInd(ind, v, full){
   const def=IND[ind.type];
-  ind.out = def.calc(v, ind.p);
+  ind.out = def.calc(v, ind.p, ind);
   def.lines.forEach(l=>{
     const arr=ind.out[l.k], s=ind.series[l.k];
     const pt=i=>{ const x=arr[i]; if(!isFinite(x)) return {time:v[i].time}; const o={time:v[i].time, value:x}; if(l.type==='hist') o.color=histColor(ind,i,arr,v); return o; };
@@ -1010,7 +1104,7 @@ $('#indPop').addEventListener('click', e=>{
   if(ind.type==='macd' && ind.p.fast>=ind.p.slow){ toast('Chu kỳ nhanh cần nhỏ hơn chu kỳ chậm.'); return; }
   if(ind.type==='mtfema' && ind.p.tf<S.intervalSec) toast(`Dữ liệu đang là khung ${tfLabel(S.intervalSec)} nên không tính được EMA khung ${tfLabel(ind.p.tf)}; EMA sẽ dùng khung ${tfLabel(S.intervalSec)}.`);
   const c=$('#indPop').querySelector('[data-k="__color"]'); if(c) ind.color=c.value;
-  styleInd(ind); if(S.vis.length) computeInd(ind, S.vis, true);
+  ind._cache=null; styleInd(ind); if(S.vis.length) computeInd(ind, S.vis, true);
   closePop(); renderLegends(); save();
 });
 $('#indPop').addEventListener('keydown', e=>{ if(e.key==='Enter'){ e.preventDefault(); $('#indPop').querySelector('[data-pop="ok"]').click(); } });
@@ -1028,23 +1122,63 @@ buildIndMenu();
 /* Lớp vẽ vùng hỗ trợ / kháng cự */
 let srDirty=1, srSig='';
 const srCv=$('#srOv'), chartEl=$('#chart');
+function visIdxAtOrBefore(t){
+  const v=S.vis; let lo=0, hi=v.length-1, r=-1;
+  while(lo<=hi){ const m=(lo+hi)>>1; if(v[m].time<=t){ r=m; lo=m+1; } else hi=m-1; }
+  return r;
+}
+function drawHtfZones(ctx, ho, pw, ph){
+  const up=cssVar('--up'), dn=cssVar('--down'), ac=cssVar('--accent'), sf=cssVar('--surface');
+  const col=z=> z.kind==='res'?dn : z.kind==='sup'?up : ac;
+  const ts=chart.timeScale(), lg=$('#indLegend'), legB=lg.offsetTop-chartEl.offsetTop+lg.offsetHeight+4, legR=lg.offsetLeft-chartEl.offsetLeft+lg.offsetWidth;
+  ho.zones.forEach(z=>{
+    const yT=series.priceToCoordinate(z.hi), yB=series.priceToCoordinate(z.lo);
+    if(yT==null||yB==null) return;
+    const top=Math.min(yT,yB), hh=Math.max(3,Math.abs(yB-yT));
+    if(top>ph+4 || top+hh<-4) return;
+    const idx=visIdxAtOrBefore(z.t); let x0 = idx<0 ? 0 : ts.logicalToCoordinate(idx);
+    x0 = x0==null ? 0 : Math.max(0, x0);
+    if(x0>=pw) return;
+    const c=col(z), W=z.tf>=604800, k=Math.min(z.touch,4)/4;
+    ctx.fillStyle=alpha(c, (W?0.10:0.06)+(W?0.10:0.08)*k); ctx.fillRect(x0, top, pw-x0, hh);
+    ctx.strokeStyle=alpha(c, W?0.9:0.6); ctx.lineWidth=W?1.5:1; ctx.setLineDash(W?[]:[6,4]);
+    ctx.beginPath(); ctx.moveTo(x0,Math.round(top)+0.5); ctx.lineTo(pw,Math.round(top)+0.5);
+    ctx.moveTo(x0,Math.round(top+hh)-0.5); ctx.lineTo(pw,Math.round(top+hh)-0.5); ctx.stroke(); ctx.setLineDash([]);
+    // vạch đứng đánh dấu nến khung lớn tạo ra vùng
+    if(idx>=0){ ctx.fillStyle=alpha(c, W?0.9:0.6); ctx.fillRect(x0, top, W?3:2, hh); }
+    const name = z.kind==='res'?'Kháng cự' : z.kind==='sup'?'Hỗ trợ' : 'Giá trong vùng';
+    const txt=`${z.code} · ${name} · ${z.touch} chạm${z.breaks?' · đã đảo vai':''}`;
+    ctx.font=(W?'600 ':'')+'11px "IBM Plex Mono", ui-monospace, monospace';
+    const tw=ctx.measureText(txt).width, ly=Math.min(Math.max(top+hh/2, 10), ph-10);
+    let lx=Math.max(x0+8, 8);
+    if(ly-8 < legB && lx < legR) lx=legR+8; // tránh chữ bị che dưới bảng tên chỉ báo
+    lx=Math.min(lx, pw-tw-12);
+    ctx.fillStyle=alpha(sf.startsWith('#')?sf:'#ffffff',0.85); ctx.fillRect(lx-4, ly-8, tw+8, 16);
+    ctx.fillStyle=c; ctx.fillText(txt, lx, ly);
+  });
+}
 function srDraw(){
   requestAnimationFrame(srDraw);
   const ind=S.inds.find(i=>i.type==='vp'), o=ind&&ind.out;
+  const hind=S.inds.find(i=>i.type==='htfsr'), ho=hind&&hind.out;
+  const hasV=!!(o && o.zones && o.zones.length), hasH=!!(ho && ho.zones && ho.zones.length);
   const w=chartEl.clientWidth, h=chartEl.clientHeight, dpr=window.devicePixelRatio||1;
   let ref='';
-  if(o && o.zones && o.zones.length){ ref=[series.priceToCoordinate(o.lo), series.priceToCoordinate(o.lo+o.bs*o.B)].join(',');
+  if((hasV||hasH) && S.bars.length){ const pr=S.bars[S.cursor].close; ref=[series.priceToCoordinate(pr), series.priceToCoordinate(pr*1.01)].join(',');
     const r=chart.timeScale().getVisibleLogicalRange(); ref+='|'+(r?r.from.toFixed(2)+','+r.to.toFixed(2):''); }
-  const sig=[w,h,dpr,srDirty,ref,S.hideTime,!!ind].join('|');
+  const sig=[w,h,dpr,srDirty,ref,S.hideTime,!!ind,!!hind].join('|');
   if(sig===srSig) return; srSig=sig;
   if(srCv.width!==Math.round(w*dpr) || srCv.height!==Math.round(h*dpr)){
     srCv.width=Math.round(w*dpr); srCv.height=Math.round(h*dpr); srCv.style.width=w+'px'; srCv.style.height=h+'px'; }
   srCv.style.left=chartEl.offsetLeft+'px'; srCv.style.top=chartEl.offsetTop+'px';
   const ctx=srCv.getContext('2d'); ctx.setTransform(dpr,0,0,dpr,0,0); ctx.clearRect(0,0,w,h);
-  if(!o || !o.zones || !o.zones.length) return;
+  if(!hasV && !hasH) return;
   const pw=chart.timeScale().width(), ph=h-(S.hideTime?0:chart.timeScale().height());
   if(!(pw>0 && ph>0)) return;
   ctx.save(); ctx.beginPath(); ctx.rect(0,0,pw,ph); ctx.clip();
+  ctx.textBaseline='middle';
+  if(hasH) drawHtfZones(ctx, ho, pw, ph);
+  if(!hasV){ ctx.restore(); return; }
   const up=cssVar('--up'), dn=cssVar('--down'), ac=cssVar('--accent'), mu=cssVar('--muted'), sf=cssVar('--surface');
   const col=z=> z.kind==='res'?dn : z.kind==='sup'?up : ac;
   let x0=chart.timeScale().timeToCoordinate(S.tfMult===1?o.startTime:bucketOf(o.startTime));
@@ -1061,7 +1195,7 @@ function srDraw(){
       ctx.fillRect(pw-bw, Math.min(yA,yB)+0.5, bw, Math.max(1,Math.abs(yB-yA)-1));
     }
   }
-  ctx.font='11px "IBM Plex Mono", ui-monospace, monospace'; ctx.textBaseline='middle';
+  ctx.font='11px "IBM Plex Mono", ui-monospace, monospace';
   o.zones.forEach(z=>{
     const yT=series.priceToCoordinate(z.hi), yB=series.priceToCoordinate(z.lo);
     if(yT==null||yB==null) return;
@@ -1143,9 +1277,10 @@ function randomStart(){
   $('#sl').value=''; $('#tp').value='';
   renderAll(true); syncLines();
 }
-function setBars(bars, sym, iv){
+function setBars(bars, sym, iv, htf){
   if(S.position){ toast('Hãy đóng lệnh đang mở trước khi đổi dữ liệu.'); return; }
   S.bars=bars; S.symbol=sym; S.intervalSec=iv; S.tfMult=1;
+  S.htfSrc=htf||{}; S.htfAgg={}; S.inds.forEach(i=>{ i._cache=null; });
   S.dec = decimals(bars[Math.floor(bars.length/2)].close);
   series.applyOptions({priceFormat:{type:'price', precision:S.dec, minMove:Math.pow(10,-S.dec)}});
   buildTF();
@@ -1465,6 +1600,7 @@ $('#nBars').value=S.nBars;
 ['startBal','riskPct','feePct'].forEach((id,i)=>$('#'+id).value=[S.startBalance,S.riskPct,S.feePct][i]);
 (S._indCfg||[]).forEach(c=>{ if(c && IND[c.type]) addInd(c.type, c.p, /^#[0-9a-f]{6}$/i.test(c.color)?c.color:null, true); });
 if(!S._v2){ ['mtfema','vp'].forEach(t=>{ if(!S.inds.some(i=>i.type===t)) addInd(t,null,t==='mtfema'?'#2962ff':null,true); }); save(); }
+if(!S._v3){ if(!S.inds.some(i=>i.type==='htfsr')) addInd('htfsr',null,null,true); save(); }
 $('#ivSel').value=S.iv;
 newSynthetic();
 renderJournal();
